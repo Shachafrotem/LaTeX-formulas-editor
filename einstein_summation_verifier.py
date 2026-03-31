@@ -318,8 +318,10 @@ class Parser:
             tok = self._peek()
             if tok is None:
                 break
-            # Stop at additive operators, '=', or closing parens
+            # Stop at additive operators, '=', or closing parens / \right
             if tok.type == T_CHAR and tok.text in ("+", "-", "=", ")"):
+                break
+            if tok.type == T_COMMAND and tok.text == r"\right":
                 break
             # Explicit multiplication sign: consume and continue
             if tok.type == T_CHAR and tok.text == "*":
@@ -337,8 +339,10 @@ class Parser:
         return result
 
     def _is_factor_start(self, tok: Token) -> bool:
-        """Check if a token can start a new factor (atom or '(')."""
+        """Check if a token can start a new factor (atom or '(' or '\\left')."""
         if tok.type == T_CHAR and tok.text == "(":
+            return True
+        if tok.type == T_COMMAND and tok.text == r"\left":
             return True
         if tok.type == T_CHAR and tok.text.isalpha():
             return True
@@ -350,13 +354,16 @@ class Parser:
         return False
 
     def _parse_factor(self) -> IndexInfo:
-        """
-        Factor = '(' Expr ')' [indices] | Atom
+        r"""
+        Factor = '(' Expr ')' [indices]
+               | '\left' delim Expr '\right' delim [indices]
+               | Atom
         """
         tok = self._peek()
         if tok is None:
             return IndexInfo({}, set())
 
+        # Plain parentheses: ( Expr )
         if tok.type == T_CHAR and tok.text == "(":
             self._advance()  # consume '('
             inner = self._parse_expr()
@@ -365,6 +372,29 @@ class Parser:
             if close and close.type == T_CHAR and close.text == ")":
                 self._advance()
             # After a parenthesized group, there might be indices on the group
+            indices = self._collect_trailing_indices()
+            if indices:
+                atom_info = self._make_index_info(indices)
+                return _merge_product(inner, atom_info)
+            return inner
+
+        # \left( ... \right)  (or \left[ ... \right] etc.)
+        if tok.type == T_COMMAND and tok.text == r"\left":
+            self._advance()  # consume \left
+            # Consume the delimiter character after \left (e.g. '(' '[' '.' etc.)
+            delim = self._peek()
+            if delim is not None:
+                self._advance()
+            inner = self._parse_expr()
+            # Consume \right
+            close = self._peek()
+            if close and close.type == T_COMMAND and close.text == r"\right":
+                self._advance()
+                # Consume the delimiter after \right
+                delim2 = self._peek()
+                if delim2 is not None and delim2.type == T_CHAR:
+                    self._advance()
+            # Trailing indices on the group
             indices = self._collect_trailing_indices()
             if indices:
                 atom_info = self._make_index_info(indices)
@@ -389,6 +419,12 @@ class Parser:
         if tok.type == T_CHAR and tok.text.isalpha():
             self._advance()
         elif tok.type == T_COMMAND:
+            # \left and \right are structural delimiters, not tensor symbols.
+            # If we reach here it means the factor handler didn't catch them
+            # (e.g. mismatched delimiters).  Skip without collecting indices.
+            if tok.text in (r"\left", r"\right"):
+                self._advance()
+                return IndexInfo({}, set())
             self._advance()
         elif tok.type == T_LBRACE:
             # Brace group as a factor — skip through matching braces

@@ -19,6 +19,7 @@ from latex_index_editor import (
     ParseError, RuleError,
     SubRule,
 )
+from einstein_summation_verifier import verify, VerificationResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,8 +48,8 @@ def test_tokenize_preserves_whitespace():
 def test_tokenize_trailing_backslash_raises():
     try:
         tokenize("a\\")
-        assert False, "Should have raised ParseError"
-    except ParseError:
+        assert False, "Should have raised ValueError"
+    except (ParseError, ValueError):
         pass
 
 def test_tokenize_roundtrip():
@@ -257,8 +258,12 @@ def test_format_report_nocrash():
     classify(toks, {"i", "j"})
     mod = substitute(toks, [SubRule("i", "k")])
     report = generate_diff(toks, mod, [SubRule("i", "k")], [], [])
-    text = format_report(report, reconstruct(mod))
-    assert "free" in text
+    input_result = verify(latex)
+    output_result = verify(reconstruct(mod))
+    text = format_report(report, reconstruct(mod),
+                         input_result=input_result,
+                         output_result=output_result)
+    assert "Well-formed" in text
     assert "i" in text
 
 
@@ -381,6 +386,92 @@ def test_three_way_contraction_warns():
     # A_i B_i C_i  —  three exclusive slots for i in one term: must warn.
     _, warns = _run(r"A_i B_i C_i", ["i"])
     assert any("possible dummy" in w.lower() for w in warns), warns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verifier integration tests  (LIE-17)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pipeline_blocks_on_ill_formed_input():
+    """Ill-formed input (triple index) should be caught by the verifier."""
+    result = verify(r"A_{iij} B_i")
+    assert not result.well_formed
+    assert result.error is not None
+
+def test_pipeline_blocks_inconsistent_free():
+    """Inconsistent free indices across additive terms should be caught."""
+    result = verify(r"A_i B_j + C_{ik}")
+    assert not result.well_formed
+
+def test_output_collision_detected():
+    """Substitution i→j when j already exists should produce ill-formed output."""
+    # Input:  A_{ij} B^j  — free: i, dummy: j — well-formed
+    latex = r"A_{ij} B^j"
+    input_result = verify(latex)
+    assert input_result.well_formed
+    assert set(input_result.free_indices.keys()) == {"i"}
+    assert "j" in input_result.dummy_indices
+
+    # Now substitute i→j: A_{jj} B^j — j appears 3 times → ill-formed
+    toks = tokenize(latex)
+    free_symbols = set(input_result.free_indices.keys())
+    classify(toks, free_symbols)
+    rules = [SubRule("i", "j")]
+    mod = substitute(toks, rules)
+    output_latex = reconstruct(mod)
+    output_result = verify(output_latex)
+    assert not output_result.well_formed
+
+def test_verifier_free_indices_drive_classification():
+    """Verifier's free-index detection should match what classify() uses."""
+    latex = r"g_{ij} v^j"
+    result = verify(latex)
+    assert result.well_formed
+    assert set(result.free_indices.keys()) == {"i"}
+    assert result.dummy_indices == {"j"}
+
+    # When classify() is given the verifier's free set, i should be free
+    toks = tokenize(latex)
+    classify(toks, set(result.free_indices.keys()))
+    i_toks = [t for t in toks if t.text == "i" and t.role != "body"]
+    assert all(t.role == "free" for t in i_toks)
+    j_toks = [t for t in toks if t.text == "j" and t.role != "body"]
+    assert all(t.role == "dummy" for t in j_toks)
+
+def test_format_report_with_verifier_results():
+    """format_report should include verifier sections when results are provided."""
+    latex = r"T^i_j"
+    toks = tokenize(latex)
+    input_result = verify(latex)
+    classify(toks, set(input_result.free_indices.keys()))
+    mod = substitute(toks, [])
+    report = generate_diff(toks, mod, [], [], [])
+    text = format_report(report, reconstruct(mod),
+                         input_result=input_result,
+                         output_result=verify(reconstruct(mod)))
+    assert "Einstein Verification (Input)" in text
+    assert "Einstein Verification (Output)" in text
+    assert "Well-formed" in text
+
+def test_format_report_ill_formed_output():
+    """format_report should show ILL-FORMED when output verification fails."""
+    from einstein_summation_verifier import VerificationResult as VR
+    ill = VR(well_formed=False, free_indices={}, dummy_indices=set(),
+             error="Index 'j' appears more than twice")
+    ok = VR(well_formed=True, free_indices={"i": False}, dummy_indices={"j"})
+    report = generate_diff([], [], [], [], [])
+    text = format_report(report, "", input_result=ok, output_result=ill)
+    assert "ILL-FORMED" in text
+
+def test_digit_not_treated_as_index():
+    """Digits should never be treated as tensor indices (LIE-3)."""
+    # T_2  — the '2' is NOT an index
+    toks = tokenize(r"T_2")
+    classify(toks, set())
+    digit_toks = [t for t in toks if t.text == "2"]
+    # digit should NOT be classified as free/dummy/structural
+    for t in digit_toks:
+        assert t.role == "body", f"Digit '2' was classified as {t.role}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

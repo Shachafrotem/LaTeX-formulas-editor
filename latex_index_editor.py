@@ -4,7 +4,7 @@ LaTeX Index Editor
 A lightweight desktop tool for reliable index substitutions in LaTeX equations.
 
 Modules implemented:
-  1. Tokenizer          – breaks LaTeX into a flat token stream
+  1. Tokenizer          – imported from einstein_summation_verifier
   2. Index Classifier   – tags tokens as free / dummy / structural / body
   3. Rule Parser        – parses  "old -> new"  substitution rules
   4. Substitution Engine – simultaneous (non-sequential) token replacement
@@ -12,6 +12,10 @@ Modules implemented:
   6. Diff / Preview     – human-readable change summary
   7. GUI                – tkinter interface (no external deps)
   8. Error Handler      – typed errors → plain-English messages
+
+The einstein_summation_verifier is the authoritative source for tokenization
+and index classification.  Free indices are auto-detected; the user no longer
+declares them manually.
 """
 
 from __future__ import annotations
@@ -20,6 +24,13 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from dataclasses import dataclass, field
 from typing import Optional
+
+from einstein_summation_verifier import (
+    tokenize, Token,
+    T_COMMAND, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET,
+    T_SUBSCRIPT, T_SUPER, T_SPACE, T_CHAR,
+    verify, VerificationResult,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,78 +73,10 @@ def friendly_message(exc: Exception) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 1 – LaTeX Tokenizer
+# MODULE 1 – LaTeX Tokenizer  (imported from einstein_summation_verifier)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Token types
-T_COMMAND   = "command"      # \alpha, \mu, \frac, …
-T_LBRACE    = "lbrace"       # {
-T_RBRACE    = "rbrace"       # }
-T_LBRACKET  = "lbracket"     # [
-T_RBRACKET  = "rbracket"     # ]
-T_SUBSCRIPT = "subscript"    # _
-T_SUPER     = "superscript"  # ^
-T_SPACE     = "space"        # whitespace run
-T_CHAR      = "char"         # any other single character
-
-
-@dataclass
-class Token:
-    type:  str
-    text:  str
-    # Set by the classifier
-    role:  str = "body"           # body | free | dummy | structural
-    upper: Optional[bool] = None  # True = ^, False = _, None = not an index
-
-
-def tokenize(latex: str) -> list[Token]:
-    """
-    Break *latex* into a flat list of Token objects.
-    Raises ParseError on illegal input.
-    """
-    tokens: list[Token] = []
-    i = 0
-    n = len(latex)
-    while i < n:
-        ch = latex[i]
-
-        # LaTeX command  \word  or  \.  (single special char after backslash)
-        if ch == "\\":
-            if i + 1 >= n:
-                raise ParseError("Trailing backslash at end of input.")
-            nxt = latex[i + 1]
-            if nxt.isalpha():
-                j = i + 1
-                while j < n and latex[j].isalpha():
-                    j += 1
-                tokens.append(Token(T_COMMAND, latex[i:j]))
-                i = j
-            else:
-                tokens.append(Token(T_COMMAND, latex[i:i+2]))
-                i += 2
-
-        elif ch == "{":
-            tokens.append(Token(T_LBRACE, ch)); i += 1
-        elif ch == "}":
-            tokens.append(Token(T_RBRACE, ch)); i += 1
-        elif ch == "[":
-            tokens.append(Token(T_LBRACKET, ch)); i += 1
-        elif ch == "]":
-            tokens.append(Token(T_RBRACKET, ch)); i += 1
-        elif ch == "_":
-            tokens.append(Token(T_SUBSCRIPT, ch)); i += 1
-        elif ch == "^":
-            tokens.append(Token(T_SUPER, ch)); i += 1
-        elif ch in (" ", "\t", "\n", "\r"):
-            j = i
-            while j < n and latex[j] in (" ", "\t", "\n", "\r"):
-                j += 1
-            tokens.append(Token(T_SPACE, latex[i:j]))
-            i = j
-        else:
-            tokens.append(Token(T_CHAR, ch)); i += 1
-
-    return tokens
+# Token types, the Token dataclass, and the tokenize() function are all
+# imported from einstein_summation_verifier at the top of this file.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +85,7 @@ def tokenize(latex: str) -> list[Token]:
 
 def _index_symbol(tok: Token) -> Optional[str]:
     """Return the *symbol string* for a token that could be an index, else None."""
-    if tok.type == T_CHAR and re.match(r"[A-Za-z0-9]", tok.text):
+    if tok.type == T_CHAR and re.match(r"[A-Za-z]", tok.text):
         return tok.text
     if tok.type == T_COMMAND:
         return tok.text          # e.g. \mu, \nu
@@ -165,7 +108,7 @@ def _collect_candidates_with_slots(
             _{…} or ^{…} group shares the same slot_id (a monotonically
             increasing integer).  This lets callers distinguish
             "two separate slots" (e.g. v_i v_i → slot 1 and slot 2) from
-            "two symbols in one slot" (e.g. \delta_{ij} → slot 1).
+            "two symbols in one slot" (e.g. delta_{ij} -> slot 1).
     """
     candidate_positions: list[int] = []
     slot_map: dict[int, int] = {}
@@ -532,7 +475,9 @@ def generate_diff(
             pos_label = "subscript" if orig.upper is False else ("superscript" if orig.upper else "position")
             changes.append(f"  token {pos}: '{orig.text}' → '{mod.text}'  [{pos_label}{ctx}]")
 
-    all_warnings = classifier_warnings + rule_warnings
+    # LIE-16: Keep only rule-parser warnings; classifier "possible dummy"
+    # warnings are now redundant with the verifier's authoritative output.
+    all_warnings = rule_warnings
     return DiffReport(
         classifications=classifications,
         dummy_patterns=dummy_patterns,
@@ -541,19 +486,40 @@ def generate_diff(
     )
 
 
-def format_report(report: DiffReport, output_latex: str) -> str:
+def format_report(
+    report: DiffReport,
+    output_latex: str,
+    *,
+    input_result: Optional[VerificationResult] = None,
+    output_result: Optional[VerificationResult] = None,
+) -> str:
     """Render a DiffReport to a human-readable string for the GUI panel."""
     lines: list[str] = []
 
-    lines.append("─── Index Classification ───")
-    if report.classifications:
-        for sym, role in sorted(report.classifications.items()):
-            pat = report.dummy_patterns.get(sym, "")
-            pat_str = f"  [{pat}]" if pat else ""
-            lines.append(f"  {sym:>8s}  →  {role}{pat_str}")
+    # ── Einstein Verification (Input) ──  [LIE-13]
+    lines.append("─── Einstein Verification (Input) ───")
+    if input_result is not None:
+        if input_result.well_formed:
+            if input_result.free_indices:
+                free_parts = []
+                for name in sorted(input_result.free_indices):
+                    pos = "upper" if input_result.free_indices[name] else "lower"
+                    free_parts.append(f"{name} ({pos})")
+                lines.append(f"  Free indices:  {', '.join(free_parts)}")
+            else:
+                lines.append("  Free indices:  (none — scalar expression)")
+            if input_result.dummy_indices:
+                lines.append(f"  Dummy indices: {', '.join(sorted(input_result.dummy_indices))}")
+            else:
+                lines.append("  Dummy indices: (none)")
+            lines.append("  Well-formed ✓")
+        else:
+            lines.append(f"  ILL-FORMED ✗")
+            lines.append(f"  {input_result.error}")
     else:
-        lines.append("  (no index symbols found)")
+        lines.append("  (not verified)")
 
+    # ── Substitutions Applied ──  [LIE-15]
     lines.append("")
     lines.append("─── Substitutions Applied ───")
     if report.changes:
@@ -561,6 +527,29 @@ def format_report(report: DiffReport, output_latex: str) -> str:
     else:
         lines.append("  (no changes made)")
 
+    # ── Einstein Verification (Output) ──  [LIE-14]
+    if output_result is not None:
+        lines.append("")
+        lines.append("─── Einstein Verification (Output) ───")
+        if output_result.well_formed:
+            if output_result.free_indices:
+                free_parts = []
+                for name in sorted(output_result.free_indices):
+                    pos = "upper" if output_result.free_indices[name] else "lower"
+                    free_parts.append(f"{name} ({pos})")
+                lines.append(f"  Free indices:  {', '.join(free_parts)}")
+            else:
+                lines.append("  Free indices:  (none — scalar expression)")
+            if output_result.dummy_indices:
+                lines.append(f"  Dummy indices: {', '.join(sorted(output_result.dummy_indices))}")
+            else:
+                lines.append("  Dummy indices: (none)")
+            lines.append("  Well-formed ✓")
+        else:
+            lines.append("  ILL-FORMED ✗")
+            lines.append(f"  {output_result.error}")
+
+    # ── Warnings ──  [LIE-16]: keep rule-parser warnings only
     if report.warnings:
         lines.append("")
         lines.append("─── Warnings ───")
@@ -662,26 +651,10 @@ class LaTeXIndexEditorApp:
             height=5,
         )
 
-        # ── Free index declaration ──
-        fi_frame = tk.Frame(left, bg=BG_DARK)
-        fi_frame.pack(fill="x", pady=(8, 0))
-        lbl = self._section_label(fi_frame, "② Free Indices  (comma-separated, e.g.  i, j, k)")
-        lbl.pack(side="left")
-        help_btn = tk.Label(fi_frame, text=" ?", fg=FG_ACCENT, bg=BG_DARK,
-                            font=("Segoe UI", 10, "bold"), cursor="hand2")
-        help_btn.pack(side="left")
-        ToolTip(help_btn,
-            "Free indices are the un-contracted (open) indices of the expression — "
-            "typically the ones that remain after all Einstein summations have been "
-            "evaluated.  Only symbols you list here will be tagged as free indices "
-            "and substituted.  Dummy (contracted) indices are detected automatically "
-            "by counting repetitions in index positions.")
-        self._free_entry = self._entry(left)
-
-        # ── Replacement rules ──
+        # ── Replacement rules ──  (was ③, now ②)
         self._rules_box = self._labeled_textbox(
             left,
-            "③ Replacement Rules  (one per line or comma-separated, e.g.  i -> r)",
+            "② Replacement Rules  (one per line or comma-separated, e.g.  i -> r)",
             height=4,
         )
 
@@ -722,7 +695,7 @@ class LaTeXIndexEditorApp:
         # ── Output formula ──
         out_hdr = tk.Frame(right, bg=BG_DARK)
         out_hdr.pack(fill="x")
-        self._section_label(out_hdr, "④ Output Formula").pack(side="left")
+        self._section_label(out_hdr, "③ Output Formula").pack(side="left")
         copy_btn = tk.Button(
             out_hdr, text="⎘ Copy",
             command=self._copy_output,
@@ -742,7 +715,7 @@ class LaTeXIndexEditorApp:
         self._output_box.pack(fill="both", expand=False, pady=(2, 0))
 
         # ── Classification & change summary ──
-        self._section_label(right, "⑤ Classification & Change Summary").pack(
+        self._section_label(right, "④ Verification & Change Summary").pack(
             anchor="w", pady=(10, 0))
         self._summary_box = tk.Text(
             right, height=18,
@@ -814,7 +787,6 @@ class LaTeXIndexEditorApp:
     def _clear_all(self):
         for box in (self._input_box, self._rules_box):
             box.delete("1.0", "end")
-        self._free_entry.delete(0, "end")
         self._set_output("")
         self._set_summary("")
         self._clear_status()
@@ -824,7 +796,6 @@ class LaTeXIndexEditorApp:
         self._clear_status()
 
         latex_input = self._input_box.get("1.0", "end").strip()
-        free_text   = self._free_entry.get().strip()
         rules_text  = self._rules_box.get("1.0", "end").strip()
 
         if not latex_input:
@@ -835,13 +806,20 @@ class LaTeXIndexEditorApp:
             # ── Module 1: Tokenize ──
             tokens = tokenize(latex_input)
 
-            # ── Parse free index list ──
-            free_symbols: set[str] = set()
-            if free_text:
-                for sym in re.split(r"[,\s]+", free_text):
-                    sym = sym.strip()
-                    if sym:
-                        free_symbols.add(sym)
+            # ── Verify input (ground truth) ──  [LIE-4]
+            input_result = verify(latex_input)
+            if not input_result.well_formed:
+                self._set_status(f"Input ill-formed: {input_result.error}")
+                self._set_summary(format_report(
+                    DiffReport({}, {}, [], []),
+                    "",
+                    input_result=input_result,
+                    output_result=None,
+                ))
+                return
+
+            # ── Free symbols from verifier (authoritative) ──  [LIE-4]
+            free_symbols: set[str] = set(input_result.free_indices.keys())
 
             # ── Module 2: Classify ──
             classifier_warnings = classify(tokens, free_symbols)
@@ -865,18 +843,30 @@ class LaTeXIndexEditorApp:
             # ── Module 5: Reconstruct ──
             output_latex = reconstruct(modified_tokens)
 
-            # ── Module 6: Diff / Preview ──
+            # ── Verify output ──  [LIE-10]
+            output_result = verify(output_latex)
+
+            # ── Module 6: Diff / Preview ──  [LIE-11]
             report = generate_diff(
                 tokens, modified_tokens, rules,
                 classifier_warnings, rule_warnings,
             )
-            summary_text = format_report(report, output_latex)
+            summary_text = format_report(
+                report, output_latex,
+                input_result=input_result,
+                output_result=output_result,
+            )
 
             # ── Update UI ──
             self._set_output(output_latex)
             self._set_summary(summary_text)
 
-            if report.warnings:
+            if not output_result.well_formed:
+                self._set_status(
+                    f"Output is ILL-FORMED after substitution: {output_result.error}",
+                    ok=False,
+                )
+            elif report.warnings:
                 self._set_status(
                     f"{len(report.warnings)} warning(s) — see summary panel.", ok=False
                 )

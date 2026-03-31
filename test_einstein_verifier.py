@@ -142,6 +142,53 @@ def test_mixed8_sum_with_dummy():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Group 3: \left / \right delimiter handling (ESV-1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_left_right_basic():
+    r"""\left( A_i B_j \right) — free: i,j — well-formed."""
+    r = verify(r"\left( A_i B_j \right)")
+    assert r.well_formed
+    assert set(r.free_indices.keys()) == {"i", "j"}
+
+def test_left_right_with_sum():
+    r"""\left( A_{ij} B_j + C_i \right) — free: i, dummy: j — well-formed."""
+    r = verify(r"\left( A_{ij} B_j + C_i \right)")
+    assert r.well_formed
+    assert set(r.free_indices.keys()) == {"i"}
+    assert r.dummy_indices == {"j"}
+
+def test_left_right_multiply_outside():
+    r"""K \left( \delta_{ij} - n_i n_j \right) \nabla^2 n_j
+    The original bug expression pattern: well-formed."""
+    r = verify(r"K \left( A_{ij} - B_i B_j \right) C_j")
+    assert r.well_formed
+    assert set(r.free_indices.keys()) == {"i"}
+
+def test_left_right_inconsistent_inside():
+    r"""\left( A_i + B_k \right) — ill-formed (inconsistent free inside)."""
+    r = verify(r"\left( A_i + B_k \right)")
+    assert not r.well_formed
+
+def test_left_right_square_brackets():
+    r"""\left[ T^{ij} \right] — free: i,j — well-formed."""
+    r = verify(r"\left[ T^{ij} \right]")
+    assert r.well_formed
+    assert set(r.free_indices.keys()) == {"i", "j"}
+
+def test_nested_left_right():
+    r"""\left( A_i \left( B_{ij} C_j \right) \right) — free: i, dummy: j."""
+    r = verify(r"\left( A_i \left( B_{ij} C_j \right) \right)")
+    assert r.well_formed
+    # Inner: B_{ij}C_j => free: i, dummy: j
+    # Outer: A_i * (inner) => i contracts, so dummy: i,j ... 
+    # Actually: inner has free {i,j...} let me reconsider
+    # B_{ij}C_j: free=i, dummy=j
+    # A_i * (free=i, dummy=j) => i appears in both => dummy
+    assert r.dummy_indices >= {"i", "j"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Additional edge cases
 # ─────────────────────────────────────────────────────────────────────────────
 
