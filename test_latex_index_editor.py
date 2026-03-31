@@ -94,13 +94,10 @@ def test_body_token_unchanged():
         assert t.role == "body"
 
 def test_conflict_warning():
-    # \mu appears twice within the same term → genuine dummy conflict is
-    # no longer warned about (user declaration is trusted unconditionally).
-    # The warning block has been removed; this test checks there are NO
-    # spurious warnings when a symbol that looks like a dummy is declared free.
+    # \mu appears twice in separate exclusive slots within one term → genuine
+    # contraction; user declaring it free should still produce a warning.
     _, warns = _run(r"T^\mu{}_\mu", [r"\mu"])
-    # No conflict warning expected — user declaration is authoritative
-    assert not any("conflict" in w.lower() or "possible dummy" in w.lower() for w in warns), warns
+    assert any("possible dummy" in w.lower() for w in warns), warns
 
 def test_braced_group_indices():
     # \nu_{ijk} — three free indices in a brace group
@@ -345,27 +342,45 @@ def test_equation_lhs_rhs_split_no_warning():
     assert warns == [], f"Unexpected warnings: {warns}"
 
 def test_genuine_dummy_still_detected_after_fix():
-    # T^{\mu}{}_{\mu}  —  \mu contracted; must still be detected as dummy
-    # even after the per-term counting change.
+    # T^{\mu}{}_{\mu}  —  \mu contracted; must still be detected as dummy.
     toks, _ = _run(r"T^{\mu}{}_{\mu}", [])
     mu_toks = [t for t in toks if t.text == r"\mu"]
     assert all(t.role == "dummy" for t in mu_toks), [(t.text, t.role) for t in mu_toks]
 
 def test_dummy_inside_parentheses_still_detected():
-    # \left( v_i v_i \right)  —  the contraction is inside \left(…\right)
-    # but is still a genuine dummy within that term.
+    # \left( v_i v_i \right)  —  contraction inside \left(…\right) is still dummy.
     toks, _ = _run(r"\left(v_i v_i\right)", [])
     i_toks = [t for t in toks if t.text == "i"]
     assert all(t.role == "dummy" for t in i_toks), [(t.text, t.role) for t in i_toks]
 
 def test_j_is_dummy_in_original_bug_expression():
-    # In the original bug expression, 'j' is genuinely contracted and must
-    # be detected as a dummy index (it appears ≥ 2 times within the RHS term).
+    # 'j' is genuinely contracted in the bug expression and must be tagged dummy.
     latex = r"h_{i}=-K\left(\delta_{ij}-n_{i}n_{j}\right)\nabla^{2}n_{j}"
     toks, _ = _run(latex, ["i"])
     j_toks = [t for t in toks if t.text == "j" and t.role != "body"]
     assert j_toks, "No 'j' index tokens found"
     assert all(t.role == "dummy" for t in j_toks), [(t.text, t.role) for t in j_toks]
+
+def test_genuine_conflict_euclidean_contraction():
+    # v_i v_i  —  'i' in two exclusive slots, same term: must warn even when
+    # user declares it free (it really is contracted).
+    _, warns = _run(r"v_i v_i", ["i"])
+    assert any("possible dummy" in w.lower() for w in warns), warns
+
+def test_genuine_conflict_trace():
+    # T_{ii}  —  trace: same symbol twice in one slot → must warn.
+    _, warns = _run(r"T_{ii}", ["i"])
+    assert any("possible dummy" in w.lower() for w in warns), warns
+
+def test_delta_ij_both_free_no_warning():
+    # \delta_{ij}  —  i and j share one slot; neither is contracted; no warning.
+    _, warns = _run(r"\delta_{ij}", ["i", "j"])
+    assert warns == [], f"Unexpected warnings: {warns}"
+
+def test_three_way_contraction_warns():
+    # A_i B_i C_i  —  three exclusive slots for i in one term: must warn.
+    _, warns = _run(r"A_i B_i C_i", ["i"])
+    assert any("possible dummy" in w.lower() for w in warns), warns
 
 
 # ─────────────────────────────────────────────────────────────────────────────

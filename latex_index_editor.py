@@ -149,14 +149,27 @@ def _index_symbol(tok: Token) -> Optional[str]:
     return None
 
 
-def _collect_candidates(tokens: list[Token]) -> list[int]:
+def _collect_candidates_with_slots(
+    tokens: list[Token],
+) -> tuple[list[int], dict[int, int]]:
     """
-    Walk the token stream and return the *indices* (into `tokens`) of every
-    token that immediately follows a _ or ^, possibly through braces.
+    Walk the token stream and return every token that sits in an index
+    position (immediately after _ or ^, possibly inside braces), together
+    with a slot-membership map.
 
-    The token at that position also has its .upper attribute set (True / False).
+    Returns:
+        candidate_positions – list of token indices in index positions.
+            Side-effect: sets .upper on each candidate token (True = ^,
+            False = _).
+        slot_map – {token_index: slot_id}.  Every token inside the same
+            _{…} or ^{…} group shares the same slot_id (a monotonically
+            increasing integer).  This lets callers distinguish
+            "two separate slots" (e.g. v_i v_i → slot 1 and slot 2) from
+            "two symbols in one slot" (e.g. \delta_{ij} → slot 1).
     """
     candidate_positions: list[int] = []
+    slot_map: dict[int, int] = {}
+    slot_id = 0
     i = 0
     n = len(tokens)
 
@@ -164,6 +177,7 @@ def _collect_candidates(tokens: list[Token]) -> list[int]:
         tok = tokens[i]
         if tok.type in (T_SUBSCRIPT, T_SUPER):
             is_upper = (tok.type == T_SUPER)
+            slot_id += 1
             i += 1
             # skip whitespace
             while i < n and tokens[i].type == T_SPACE:
@@ -180,6 +194,7 @@ def _collect_candidates(tokens: list[Token]) -> list[int]:
                     if _index_symbol(tokens[i]) is not None:
                         tokens[i].upper = is_upper
                         candidate_positions.append(i)
+                        slot_map[i] = slot_id
                     i += 1
                 i += 1  # skip }
             else:
@@ -187,10 +202,20 @@ def _collect_candidates(tokens: list[Token]) -> list[int]:
                 if _index_symbol(tokens[i]) is not None:
                     tokens[i].upper = is_upper
                     candidate_positions.append(i)
+                    slot_map[i] = slot_id
                 i += 1
         else:
             i += 1
 
+    return candidate_positions, slot_map
+
+
+def _collect_candidates(tokens: list[Token]) -> list[int]:
+    """
+    Convenience wrapper around _collect_candidates_with_slots that returns
+    only the candidate position list (for callers that don't need slot info).
+    """
+    candidate_positions, _ = _collect_candidates_with_slots(tokens)
     return candidate_positions
 
 
@@ -262,18 +287,18 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
       'structural' – syntactic index position but not a tensor index
       'body'       – not in any index position
 
-    Returns a sorted list of warnings (strings).
+    Returns a list of warnings (strings).
     """
     warnings: list[str] = []
 
-    candidate_positions = _collect_candidates(tokens)
+    candidate_positions, slot_map = _collect_candidates_with_slots(tokens)
 
-    # Split candidates into per-term groups and detect dummies per term.
-    # A symbol is a dummy index if it appears ≥ 2 times within the same
-    # top-level term.  Counting globally (across the whole expression) is
-    # wrong because a free index legitimately appears once per term in every
-    # additive summand, giving a large global count that does not indicate
-    # contraction.
+    # ── Per-term dummy detection ──────────────────────────────────────────────
+    # Split candidates into groups, one per top-level additive term (terms are
+    # separated by +, -, or = at nesting depth zero).  A symbol is a dummy
+    # index only if it appears ≥ 2 times within the *same* term — counting
+    # globally is wrong because a free index legitimately appears once per term
+    # in every summand of a multi-term expression.
     term_groups = _split_candidates_by_term(tokens, candidate_positions)
     detected_dummy: set[str] = set()
     for group in term_groups:
@@ -286,13 +311,57 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
             if cnt >= 2:
                 detected_dummy.add(sym)
 
-    # User-declared free symbols are trusted unconditionally.
-    # The former conflict warning (fired when a declared free symbol also
-    # appeared in detected_dummy) has been removed because realistic physics
-    # expressions such as  h_{i} = -K(δ_{ij} - n_{i}n_{j})∇²n_{j}  produce
-    # unavoidable false positives: the count-based heuristic cannot distinguish
-    # "two different free indices sharing a tensor slot" from "an index
-    # contracted with itself".  The user's explicit declaration is authoritative.
+    # ── Slot-aware conflict check for user-declared free symbols ─────────────
+    # The simple per-term count is not enough to distinguish a genuinely free
+    # index from a mistakenly declared one, because a multi-index slot like
+    # \delta_{ij} causes both i and j to appear in the same term without being
+    # contracted.  We use slot structure to make a more precise decision:
+    #
+    # A user-declared free symbol is flagged as a conflict if, within any
+    # single top-level term, it occupies ≥ 2 *exclusive* slots — where an
+    # exclusive slot is one whose entire symbol content is just that one symbol
+    # (no companion indices in the same slot).  This correctly catches:
+    #   v_i v_i      — two exclusive slots in one term → warn
+    #   T_{ii}       — one slot but the symbol appears twice in it → warn (trace)
+    #   A_i B_i C_i  — three exclusive slots → warn
+    # and correctly clears:
+    #   \delta_{ij}  — i shares its slot with j → slot not exclusive → no warn
+    #   h_{i}=-K(\delta_{ij}-n_{i}n_{j})\nabla^2 n_{j}
+    #                — on the RHS, i appears in \delta_{ij} (not exclusive)
+    #                  and n_{i} (exclusive), giving only 1 exclusive slot
+    #                  in that term → no warn
+    #   a_{ij}b^j + c_{i}  — i has 1 exclusive slot per term → no warn
+
+    for sym in sorted(free_symbols):
+        for group in term_groups:
+            # Collect the set of symbols in each slot for this term
+            slot_syms: dict[int, list[str]] = {}
+            for pos in group:
+                sid = slot_map.get(pos)
+                s = _index_symbol(tokens[pos])
+                if sid is not None and s:
+                    slot_syms.setdefault(sid, []).append(s)
+
+            # Trace: sym appears twice inside the same slot (e.g. T_{ii})
+            trace = any(
+                syms.count(sym) >= 2
+                for syms in slot_syms.values()
+                if sym in syms
+            )
+            # Exclusive slots: slots whose only distinct symbol is sym
+            exclusive_count = sum(
+                1 for syms in slot_syms.values()
+                if sym in syms and len(set(syms)) == 1
+            )
+
+            if trace or exclusive_count >= 2:
+                total = sum(1 for pos in group if _index_symbol(tokens[pos]) == sym)
+                warnings.append(
+                    f"'{sym}' is declared as a free index but appears {total} time(s) "
+                    f"in exclusive index slots within the same term "
+                    f"(possible dummy index). Please verify."
+                )
+                break  # one warning per symbol is enough
 
     # Tag candidate tokens
     for pos in candidate_positions:
