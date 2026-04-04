@@ -32,7 +32,6 @@ from einstein_summation_verifier import (
     verify, VerificationResult,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 8 – Error Handler  (defined first; used by every other module)
 # ─────────────────────────────────────────────────────────────────────────────
