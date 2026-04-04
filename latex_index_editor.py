@@ -616,6 +616,16 @@ class LaTeXIndexEditorApp:
         root.minsize(370, 700)
 
         self._build_ui()
+        self._dock_right()
+
+    def _dock_right(self):
+        """Position the window flush against the right edge of the screen."""
+        self.root.update_idletasks()
+        win_w = 400
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = screen_w - win_w
+        self.root.geometry(f"{win_w}x{screen_h}+{x}+0")
 
     # ── UI construction ──────────────────────────────────────────────────────
 
