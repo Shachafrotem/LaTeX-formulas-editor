@@ -36,6 +36,10 @@ T_SUPER     = "superscript"
 T_SPACE     = "space"
 T_CHAR      = "char"
 
+# Letters that occupy index positions syntactically but are never tensor indices.
+# "t" represents time in physics and must not be treated as a summation index.
+NON_INDEX_LETTERS: frozenset[str] = frozenset({"t"})
+
 
 @dataclass
 class Token:
@@ -220,10 +224,9 @@ class Parser:
     - Equation sides: =
     """
 
-    def __init__(self, tokens: list[Token], non_index_symbols: frozenset = frozenset()):
+    def __init__(self, tokens: list[Token]):
         self.tokens = tokens
         self.pos = 0
-        self.non_index_symbols = non_index_symbols
 
     def _peek(self) -> Optional[Token]:
         """Look at the current token without consuming it (skips whitespace)."""
@@ -500,16 +503,13 @@ class Parser:
     def _index_symbol(self, tok: Token) -> Optional[str]:
         """Return the symbol string if this token can be an index, else None."""
         if tok.type == T_CHAR and re.match(r"[A-Za-z]", tok.text):
-            sym = tok.text
-        elif tok.type == T_COMMAND:
-            sym = tok.text
-        else:
-            # Skip commas, spaces, digits-in-indices, backslash-space, etc.
-            return None
-        # Feature B: user-declared non-index symbols are excluded.
-        if sym in self.non_index_symbols:
-            return None
-        return sym
+            if tok.text in NON_INDEX_LETTERS:
+                return None
+            return tok.text
+        if tok.type == T_COMMAND:
+            return tok.text
+        # Skip commas, spaces, digits-in-indices, backslash-space, etc.
+        return None
 
     def _make_index_info(self, indices: list[Index]) -> IndexInfo:
         """
@@ -558,19 +558,10 @@ class VerificationResult:
         return f"Well-formed. Free indices: {free_str}. Dummy indices: {dummy_str}."
 
 
-def verify(latex: str, non_index_symbols: frozenset = frozenset()) -> VerificationResult:
+def verify(latex: str) -> VerificationResult:
     """
     Verify that a LaTeX tensor expression is well-formed under Einstein
     summation convention.
-
-    Parameters
-    ----------
-    latex : str
-        The raw LaTeX expression to verify.
-    non_index_symbols : frozenset, optional
-        Symbols that should never be treated as tensor indices even when they
-        appear in superscript / subscript positions (e.g. 'T' for transpose,
-        '\\dagger' for adjoint).  Defaults to the empty set.
 
     Returns a VerificationResult with:
       - well_formed: bool
@@ -579,7 +570,7 @@ def verify(latex: str, non_index_symbols: frozenset = frozenset()) -> Verificati
       - error: description if ill-formed
     """
     tokens = tokenize(latex)
-    parser = Parser(tokens, non_index_symbols)
+    parser = Parser(tokens)
     info = parser.parse_full()
 
     if info.error:

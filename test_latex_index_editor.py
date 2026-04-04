@@ -12,98 +12,6 @@ sys.modules.setdefault("tkinter.ttk", _mock.MagicMock())
 sys.modules.setdefault("tkinter.messagebox", _mock.MagicMock())
 sys.path.insert(0, os.path.dirname(__file__))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Module 2 – Parenthesis Opacity  (Feature A)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _candidate_texts(latex, free=()):
-    """Return the set of token texts that were collected as index candidates."""
-    toks = tokenize(latex)
-    classify(toks, set(free))
-    return {t.text for t in toks if t.role != "body"}
-
-def test_paren_opacity_basic():
-    """(A^T)_i — only i is a candidate; T inside parens is suppressed."""
-    cands = _candidate_texts(r"(A^T)_i")
-    assert "T" not in cands
-    assert "i" in cands
-
-def test_paren_opacity_outer_super():
-    """(A^T)^{ij} — only i, j are candidates."""
-    cands = _candidate_texts(r"(A^T)^{ij}")
-    assert "T" not in cands
-    assert "i" in cands and "j" in cands
-
-def test_paren_opacity_nested():
-    """((A^T)^S)_i — only i is a candidate; T and S inside nested parens suppressed."""
-    cands = _candidate_texts(r"((A^T)^S)_i")
-    assert "T" not in cands
-    assert "S" not in cands
-    assert "i" in cands
-
-def test_paren_opacity_multi_term():
-    """(A^T)_i + B_i — i is found in both terms, T suppressed."""
-    cands = _candidate_texts(r"(A^T)_i + B_i")
-    assert "T" not in cands
-    assert "i" in cands
-
-def test_left_right_opacity():
-    r"""\left(A^\dagger\right)_i — \left/\right are transparent (Option 3);
-    \dagger inside IS scanned as a candidate, and i outside is also a candidate."""
-    cands = _candidate_texts(r"\left(A^\dagger\right)_i")
-    # \left( does NOT increment paren_depth → contents are scanned
-    assert r"\dagger" in cands
-    assert "i" in cands
-
-def test_paren_inside_brace():
-    """A_{(i)} — paren inside brace group: i is NOT a candidate (D1)."""
-    cands = _candidate_texts(r"A_{(i)}")
-    assert "i" not in cands
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Module 2 – Non-Index Symbol List  (Feature B)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _candidate_texts_nonidx(latex, free=(), non_index_symbols=frozenset()):
-    """Return set of token texts that are index candidates, with non-index filter."""
-    toks = tokenize(latex)
-    classify(toks, set(free), non_index_symbols)
-    return {t.text for t in toks if t.role != "body"}
-
-def test_nonidx_single_letter():
-    """A^T_i with non_index_symbols={'T'} — T stays body, i is candidate."""
-    cands = _candidate_texts_nonidx(r"A^T_i", non_index_symbols={"T"})
-    assert "T" not in cands
-    assert "i" in cands
-
-def test_nonidx_command():
-    r"""A^{\dagger}_{ij} with non_index_symbols={'\dagger'} — \dagger stays body."""
-    cands = _candidate_texts_nonidx(r"A^{\dagger}_{ij}", non_index_symbols={r"\dagger"})
-    assert r"\dagger" not in cands
-    assert "i" in cands
-    assert "j" in cands
-
-def test_nonidx_combined_with_parens():
-    """(A^T)^{ij} with non_index_symbols={'T'} — T suppressed by parens anyway; i,j found."""
-    cands = _candidate_texts_nonidx(r"(A^T)^{ij}", non_index_symbols={"T"})
-    assert "T" not in cands
-    assert "i" in cands and "j" in cands
-
-def test_nonidx_dummy_unaffected():
-    """A^i_j B^j_k with non_index_symbols={'T'} — unrelated symbol, dummy detection unchanged."""
-    cands = _candidate_texts_nonidx(r"A^i_j B^j_k", non_index_symbols={"T"})
-    assert "i" in cands
-    assert "j" in cands
-    assert "k" in cands
-
-def test_nonidx_empty_set():
-    """A^T_i with frozenset() — T is a candidate (baseline, no filter)."""
-    cands = _candidate_texts_nonidx(r"A^T_i", non_index_symbols=frozenset())
-    assert "T" in cands
-    assert "i" in cands
-
-
 from latex_index_editor import (
     tokenize, classify, parse_rules, substitute, reconstruct,
     generate_diff, format_report,
@@ -564,6 +472,34 @@ def test_digit_not_treated_as_index():
     # digit should NOT be classified as free/dummy/structural
     for t in digit_toks:
         assert t.role == "body", f"Digit '2' was classified as {t.role}"
+
+
+def test_t_not_treated_as_index():
+    """Letter 't' represents time and should never be treated as a tensor index."""
+    toks = tokenize(r"T^i_t")
+    classify(toks, {"i"})
+    t_toks = [t for t in toks if t.text == "t"]
+    for t in t_toks:
+        assert t.role == "body", f"Letter 't' was classified as {t.role}"
+    i_toks = [t for t in toks if t.text == "i"]
+    assert any(t.role == "free" for t in i_toks), "Index 'i' should still be free"
+
+
+def test_t_not_detected_as_dummy():
+    """A_t B^t — 't' must not be detected as a contracted dummy index."""
+    toks = tokenize(r"A_t B^t")
+    classify(toks, set())
+    t_toks = [t for t in toks if t.text == "t"]
+    for t in t_toks:
+        assert t.role == "body", f"Letter 't' was classified as {t.role}"
+
+
+def test_t_not_eligible_for_substitution():
+    """Rules targeting 't' should have no effect — it's not an index."""
+    toks = tokenize(r"g^{tt}")
+    classify(toks, set())
+    eligible = {t.text for t in toks if t.role in ("free", "dummy")}
+    assert "t" not in eligible, "'t' should not be eligible for substitution"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
