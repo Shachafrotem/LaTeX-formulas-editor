@@ -613,7 +613,7 @@ class LaTeXIndexEditorApp:
         root.title("LaTeX Index Editor")
         root.configure(bg=BG_DARK)
         root.resizable(True, True)
-        root.minsize(780, 580)
+        root.minsize(370, 700)
 
         self._build_ui()
 
@@ -623,61 +623,78 @@ class LaTeXIndexEditorApp:
         root = self.root
 
         # ── Title bar ──
-        title_frame = tk.Frame(root, bg=BG_PANEL, pady=10)
+        title_frame = tk.Frame(root, bg=BG_PANEL, pady=6)
         title_frame.pack(fill="x", side="top")
         tk.Label(
             title_frame, text="LaTeX Index Editor",
-            font=("Segoe UI", 15, "bold"),
+            font=("Segoe UI", 12, "bold"),
             bg=BG_PANEL, fg=FG_ACCENT,
-        ).pack(side="left", padx=16)
-        tk.Label(
-            title_frame,
-            text="Reliable tensor-index substitution in LaTeX equations",
-            font=("Segoe UI", 9), bg=BG_PANEL, fg=FG_DIM,
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=12)
 
-        # ── Main layout: left column (inputs) + right column (outputs) ──
-        main = tk.Frame(root, bg=BG_DARK)
-        main.pack(fill="both", expand=True, padx=12, pady=8)
+        # ── Scrollable main area ──
+        # Use a canvas + frame so the whole UI scrolls if the window is short
+        outer = tk.Frame(root, bg=BG_DARK)
+        outer.pack(fill="both", expand=True)
 
-        left  = tk.Frame(main, bg=BG_DARK)
-        right = tk.Frame(main, bg=BG_DARK)
-        left.pack(side="left",  fill="both", expand=True, padx=(0, 6))
-        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        canvas = tk.Canvas(outer, bg=BG_DARK, highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        self._main_frame = tk.Frame(canvas, bg=BG_DARK)
 
-        # ── Input formula ──
-        self._input_box = self._labeled_textbox(
-            left, "① Input Formula  (paste your LaTeX equation)",
-            height=5,
+        self._main_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
+        canvas_window = canvas.create_window((0, 0), window=self._main_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        # ── Replacement rules ──  (was ③, now ②)
-        self._rules_box = self._labeled_textbox(
-            left,
-            "② Replacement Rules  (one per line or comma-separated, e.g.  i -> r)",
+        # Make the inner frame stretch to the canvas width
+        def _on_canvas_resize(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Mousewheel scrolling
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        col = self._main_frame  # single-column parent
+
+        # ── (1) Input formula ──
+        self._input_box = self._labeled_textbox(
+            col, "(1) Input Formula (paste your LaTeX equation)",
             height=4,
         )
 
-        # ── Apply button ──
-        btn_frame = tk.Frame(left, bg=BG_DARK)
-        btn_frame.pack(fill="x", pady=10)
+        # ── (2) Replacement rules ──
+        self._rules_box = self._labeled_textbox(
+            col,
+            "(2) Replacement Rules\n(one per line or comma-separated, e.g.  i->r)",
+            height=3,
+        )
+
+        # ── Buttons row: Apply + Clear side by side ──
+        btn_frame = tk.Frame(col, bg=BG_DARK)
+        btn_frame.pack(fill="x", pady=(8, 2), padx=8)
         self._apply_btn = tk.Button(
-            btn_frame, text="▶  Apply Substitution",
+            btn_frame, text="Apply Substitution",
             command=self._run,
             bg=ACCENT, fg="white",
-            font=("Segoe UI", 11, "bold"),
-            relief="flat", padx=16, pady=6,
+            font=("Segoe UI", 10, "bold"),
+            relief="flat", padx=14, pady=5,
             activebackground="#1D4ED8", activeforeground="white",
             cursor="hand2",
         )
         self._apply_btn.pack(side="left")
 
         self._clear_btn = tk.Button(
-            btn_frame, text="✕  Clear All",
+            btn_frame, text="Clear All",
             command=self._clear_all,
             bg=BG_PANEL, fg=FG_DIM,
             font=("Segoe UI", 10),
-            relief="flat", padx=10, pady=6,
+            relief="flat", padx=14, pady=5,
             cursor="hand2",
         )
         self._clear_btn.pack(side="left", padx=(8, 0))
@@ -685,19 +702,18 @@ class LaTeXIndexEditorApp:
         # ── Error / status bar ──
         self._status_var = tk.StringVar(value="")
         self._status_lbl = tk.Label(
-            left, textvariable=self._status_var,
+            col, textvariable=self._status_var,
             bg=BG_DARK, fg=FG_WARN,
-            font=("Segoe UI", 9), justify="left", wraplength=360,
-            anchor="w",
+            font=("Segoe UI", 9), justify="left",
+            anchor="w", wraplength=340,
         )
-        self._status_lbl.pack(fill="x", pady=(0, 4))
+        self._status_lbl.pack(fill="x", padx=8, pady=(2, 4))
 
-        # ── Output formula ──
-        out_hdr = tk.Frame(right, bg=BG_DARK)
-        out_hdr.pack(fill="x")
-        self._section_label(out_hdr, "③ Output Formula").pack(side="left")
+        # ── (3) Output formula with Copy button right-aligned above ──
+        copy_row = tk.Frame(col, bg=BG_DARK)
+        copy_row.pack(fill="x", padx=8, pady=(4, 0))
         copy_btn = tk.Button(
-            out_hdr, text="⎘ Copy",
+            copy_row, text="Copy",
             command=self._copy_output,
             bg=BG_PANEL, fg=FG_ACCENT,
             font=("Segoe UI", 9), relief="flat", padx=8, pady=2,
@@ -706,25 +722,25 @@ class LaTeXIndexEditorApp:
         copy_btn.pack(side="right")
 
         self._output_box = tk.Text(
-            right, height=5,
+            col, height=4,
             font=FONT_MONO, bg=BG_FIELD, fg=FG_OK,
             insertbackground=FG_MAIN, relief="flat",
             padx=8, pady=6, state="disabled",
             highlightbackground=BORDER, highlightthickness=1,
         )
-        self._output_box.pack(fill="both", expand=False, pady=(2, 0))
+        self._output_box.pack(fill="both", expand=False, padx=8, pady=(2, 0))
 
-        # ── Classification & change summary ──
-        self._section_label(right, "④ Verification & Change Summary").pack(
-            anchor="w", pady=(10, 0))
+        # ── (4) Verification & Change Summary ──
+        self._section_label(col, "(4) Verification & Change Summary").pack(
+            anchor="w", padx=8, pady=(10, 0))
         self._summary_box = tk.Text(
-            right, height=18,
-            font=("Courier New", 10), bg=BG_FIELD, fg=FG_DIM,
+            col, height=14,
+            font=("Courier New", 9), bg=BG_FIELD, fg=FG_DIM,
             insertbackground=FG_MAIN, relief="flat",
             padx=8, pady=6, state="disabled",
             highlightbackground=BORDER, highlightthickness=1,
         )
-        self._summary_box.pack(fill="both", expand=True, pady=(2, 0))
+        self._summary_box.pack(fill="both", expand=True, padx=8, pady=(2, 8))
 
     # ── Helper widget builders ────────────────────────────────────────────────
 
