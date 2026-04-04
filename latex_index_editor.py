@@ -32,6 +32,7 @@ from einstein_summation_verifier import (
     verify, VerificationResult,
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 8 – Error Handler  (defined first; used by every other module)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +94,7 @@ def _index_symbol(tok: Token) -> Optional[str]:
 
 def _collect_candidates_with_slots(
     tokens: list[Token],
+    non_index_symbols: frozenset = frozenset(),
 ) -> tuple[list[int], dict[int, int]]:
     """
     Walk the token stream and return every token that sits in an index
@@ -112,12 +114,35 @@ def _collect_candidates_with_slots(
     candidate_positions: list[int] = []
     slot_map: dict[int, int] = {}
     slot_id = 0
+    paren_depth = 0
+    prev_non_space_was_left = False   # True when last non-space token was \left or \right
     i = 0
     n = len(tokens)
 
     while i < n:
         tok = tokens[i]
-        if tok.type in (T_SUBSCRIPT, T_SUPER):
+
+        # ── Parenthesis depth tracking (Feature A) ────────────────────
+        # Only *bare* '(' / ')' are opaque — those NOT immediately preceded
+        # by \left / \right.  '\left(' is a display-size bracket around an
+        # ordinary tensor sub-expression and must remain transparent.
+        # Strategy: track whether the previous non-whitespace token was
+        # \left or \right.  A '(' that follows \left does NOT increment
+        # paren_depth.  A ')' decrements only when paren_depth > 0 (i.e.
+        # when a bare '(' was previously seen).
+        if tok.type == T_CHAR and tok.text == "(":
+            if not prev_non_space_was_left:
+                paren_depth += 1
+        elif tok.type == T_CHAR and tok.text == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+
+        # Update lookahead flag for next iteration (ignore whitespace tokens).
+        if tok.type != T_SPACE:
+            prev_non_space_was_left = (
+                tok.type == T_COMMAND and tok.text in (r"\left", r"\right")
+            )
+        if tok.type in (T_SUBSCRIPT, T_SUPER) and paren_depth == 0:
             is_upper = (tok.type == T_SUPER)
             slot_id += 1
             i += 1
@@ -128,20 +153,30 @@ def _collect_candidates_with_slots(
                 break
 
             if tokens[i].type == T_LBRACE:
-                # collect everything inside the braces
+                # collect everything inside the braces, but still respect
+                # parens (D1: _{(i)} is opaque — i is not a candidate)
                 i += 1  # skip {
                 while i < n and tokens[i].type == T_SPACE:
                     i += 1
+                inner_paren_depth = 0
                 while i < n and tokens[i].type != T_RBRACE:
-                    if _index_symbol(tokens[i]) is not None:
-                        tokens[i].upper = is_upper
+                    t = tokens[i]
+                    if t.type == T_CHAR and t.text == "(":
+                        inner_paren_depth += 1
+                    elif t.type == T_CHAR and t.text == ")":
+                        inner_paren_depth -= 1
+                    elif (inner_paren_depth == 0
+                            and _index_symbol(t) is not None
+                            and t.text not in non_index_symbols):
+                        t.upper = is_upper
                         candidate_positions.append(i)
                         slot_map[i] = slot_id
                     i += 1
                 i += 1  # skip }
             else:
                 # single-token index
-                if _index_symbol(tokens[i]) is not None:
+                if (_index_symbol(tokens[i]) is not None
+                        and tokens[i].text not in non_index_symbols):
                     tokens[i].upper = is_upper
                     candidate_positions.append(i)
                     slot_map[i] = slot_id
@@ -152,12 +187,12 @@ def _collect_candidates_with_slots(
     return candidate_positions, slot_map
 
 
-def _collect_candidates(tokens: list[Token]) -> list[int]:
+def _collect_candidates(tokens: list[Token], non_index_symbols: frozenset = frozenset()) -> list[int]:
     """
     Convenience wrapper around _collect_candidates_with_slots that returns
     only the candidate position list (for callers that don't need slot info).
     """
-    candidate_positions, _ = _collect_candidates_with_slots(tokens)
+    candidate_positions, _ = _collect_candidates_with_slots(tokens, non_index_symbols)
     return candidate_positions
 
 
@@ -221,7 +256,7 @@ def _split_candidates_by_term(
     return [g for g in groups if g]
 
 
-def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
+def classify(tokens: list[Token], free_symbols: set[str], non_index_symbols: frozenset = frozenset()) -> list[str]:
     """
     Tag every token in *tokens* with a .role:
       'free'       – declared by the user as a free index
@@ -233,7 +268,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
     """
     warnings: list[str] = []
 
-    candidate_positions, slot_map = _collect_candidates_with_slots(tokens)
+    candidate_positions, slot_map = _collect_candidates_with_slots(tokens, non_index_symbols)
 
     # ── Per-term dummy detection ──────────────────────────────────────────────
     # Split candidates into groups, one per top-level additive term (terms are
@@ -677,10 +712,23 @@ class LaTeXIndexEditorApp:
             height=4,
         )
 
-        # ── (2) Replacement rules ──
+        # ── (2) Non-index symbols ──
+        self._section_label(
+            col,
+            "(2) Non-index symbols  (comma-separated, e.g.  T, \\dagger, \\top)",
+        ).pack(anchor="w", padx=8, pady=(8, 0))
+        self._nonidx_entry = self._entry(col)
+        ToolTip(
+            self._nonidx_entry,
+            "Symbols in superscript/subscript positions that are NOT tensor indices\n"
+            "e.g. transpose (T), adjoint (\\dagger), power labels (2, n).\n"
+            "These are ignored by the classifier and verifier.",
+        )
+
+        # ── (3) Replacement rules ──
         self._rules_box = self._labeled_textbox(
             col,
-            "(2) Replacement Rules\n(one per line or comma-separated, e.g.  i->r)",
+            "(3) Replacement Rules\n(one per line or comma-separated, e.g.  i->r)",
             height=3,
         )
 
@@ -718,7 +766,7 @@ class LaTeXIndexEditorApp:
         )
         self._status_lbl.pack(fill="x", padx=8, pady=(2, 4))
 
-        # ── (3) Output formula with Copy button right-aligned above ──
+        # ── (4) Output formula with Copy button right-aligned above ──
         copy_row = tk.Frame(col, bg=BG_DARK)
         copy_row.pack(fill="x", padx=8, pady=(4, 0))
         copy_btn = tk.Button(
@@ -739,8 +787,8 @@ class LaTeXIndexEditorApp:
         )
         self._output_box.pack(fill="both", expand=False, padx=8, pady=(2, 0))
 
-        # ── (4) Verification & Change Summary ──
-        self._section_label(col, "(4) Verification & Change Summary").pack(
+        # ── (5) Verification & Change Summary ──
+        self._section_label(col, "(5) Verification & Change Summary").pack(
             anchor="w", padx=8, pady=(10, 0))
         self._summary_box = tk.Text(
             col, height=14,
@@ -812,6 +860,7 @@ class LaTeXIndexEditorApp:
     def _clear_all(self):
         for box in (self._input_box, self._rules_box):
             box.delete("1.0", "end")
+        self._nonidx_entry.delete(0, "end")
         self._set_output("")
         self._set_summary("")
         self._clear_status()
@@ -822,6 +871,10 @@ class LaTeXIndexEditorApp:
 
         latex_input = self._input_box.get("1.0", "end").strip()
         rules_text  = self._rules_box.get("1.0", "end").strip()
+        nonidx_text = self._nonidx_entry.get().strip()
+        non_index_symbols = frozenset(
+            s.strip() for s in nonidx_text.split(",") if s.strip()
+        ) if nonidx_text else frozenset()
 
         if not latex_input:
             self._set_status("Please enter a LaTeX formula in the Input Formula field.")
@@ -832,7 +885,7 @@ class LaTeXIndexEditorApp:
             tokens = tokenize(latex_input)
 
             # ── Verify input (ground truth) ──  [LIE-4]
-            input_result = verify(latex_input)
+            input_result = verify(latex_input, non_index_symbols)
             if not input_result.well_formed:
                 self._set_status(f"Input ill-formed: {input_result.error}")
                 self._set_summary(format_report(
@@ -847,7 +900,7 @@ class LaTeXIndexEditorApp:
             free_symbols: set[str] = set(input_result.free_indices.keys())
 
             # ── Module 2: Classify ──
-            classifier_warnings = classify(tokens, free_symbols)
+            classifier_warnings = classify(tokens, free_symbols, non_index_symbols)
 
             # Compute eligible symbols (free + dummy)
             eligible: set[str] = set()
@@ -869,7 +922,7 @@ class LaTeXIndexEditorApp:
             output_latex = reconstruct(modified_tokens)
 
             # ── Verify output ──  [LIE-10]
-            output_result = verify(output_latex)
+            output_result = verify(output_latex, non_index_symbols)
 
             # ── Module 6: Diff / Preview ──  [LIE-11]
             report = generate_diff(
