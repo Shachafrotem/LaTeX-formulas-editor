@@ -36,9 +36,36 @@ T_SUPER     = "superscript"
 T_SPACE     = "space"
 T_CHAR      = "char"
 
+# ─── Non-index exclusion sets ─────────────────────────────────────────────────
 # Letters that occupy index positions syntactically but are never tensor indices.
 # "t" represents time in physics and must not be treated as a summation index.
 NON_INDEX_LETTERS: frozenset[str] = frozenset({"t"})
+
+# LaTeX commands that appear in index positions but are labels/operators, not
+# tensor indices. Extend this (or patch via sed) to exclude additional symbols.
+NON_INDEX_COMMANDS: frozenset[str] = frozenset({
+    r"\perp", r"\parallel", r"\rm", r"\mathrm",
+})
+
+# ─── Transparent decorator commands ──────────────────────────────────────────
+# These commands wrap a single brace argument that may carry tensor indices.
+# They are parsed transparently — their inner content contributes indices.
+_TRANSPARENT_COMMANDS: frozenset[str] = frozenset({
+    r"\tilde", r"\hat", r"\bar", r"\dot", r"\ddot",
+    r"\sqrt", r"\mathcal", r"\mathbf", r"\boldsymbol",
+    r"\partial", r"\nabla", r"\vec", r"\overline",
+    r"\underline", r"\cancel", r"\bracenote",
+    r"\widetilde", r"\widehat", r"\check", r"\acute",
+    r"\grave", r"\breve",
+})
+
+# ─── Equation-like relation separators ───────────────────────────────────────
+# These relation symbols split an expression into sides that must have matching
+# free indices, exactly like '='.
+_EQUATION_SEPARATORS: frozenset[str] = frozenset({
+    r"\approx", r"\equiv", r"\iff", r"\Rightarrow", r"\Leftrightarrow",
+    r"\sim", r"\simeq",
+})
 
 
 @dataclass
@@ -110,7 +137,7 @@ class Index:
 #   Equation  = Expr '=' Expr
 #   Expr      = Term (('+' | '-') Term)*
 #   Term      = Factor (implicit-multiply Factor)*
-#   Factor    = '(' Expr ')' | Atom
+#   Factor    = '(' Expr ')' | '\left' Expr '\right' | \frac{}{} | decorator{} | Atom
 #   Atom      = tensor-symbol with its subscript/superscript indices
 
 
@@ -125,7 +152,7 @@ class IndexInfo:
 def _merge_product(left: IndexInfo, right: IndexInfo) -> IndexInfo:
     """
     Merge index info for a product of two factors.
-    
+
     When two factors are multiplied:
     - An index that appears once in left AND once in right becomes dummy.
     - An index appearing twice already (dummy) in either stays dummy.
@@ -137,9 +164,7 @@ def _merge_product(left: IndexInfo, right: IndexInfo) -> IndexInfo:
     if right.error:
         return right
 
-    # Collect all index occurrences with their positions
-    # We need to count total occurrences across both sides
-    all_free = {}       # name -> is_upper (for indices appearing exactly once total)
+    all_free = {}
     new_dummy = set(left.dummy) | set(right.dummy)
 
     # Check for conflicts: a dummy in one side appearing in the other is an error
@@ -157,7 +182,7 @@ def _merge_product(left: IndexInfo, right: IndexInfo) -> IndexInfo:
     # Now merge free indices from both sides
     for name, is_upper in left.free.items():
         if name in right.free:
-            # Appears in both -> becomes dummy
+            # Appears in both -> becomes dummy (contraction)
             new_dummy.add(name)
         else:
             all_free[name] = is_upper
@@ -169,12 +194,17 @@ def _merge_product(left: IndexInfo, right: IndexInfo) -> IndexInfo:
     return IndexInfo(all_free, new_dummy)
 
 
-def _merge_sum(terms: list[IndexInfo]) -> IndexInfo:
+def _merge_sum(terms: list[IndexInfo], strict: bool = True) -> IndexInfo:
     """
     Merge index info for a sum of terms.
-    
-    All terms must have the same free indices (name AND position).
-    Dummy indices are collected from all terms.
+
+    In strict mode (default, used at top level):
+      All terms must have the same free indices (name AND position).
+
+    In permissive mode (strict=False, used inside brackets):
+      Returns the union of free indices. This defers consistency checking
+      to the outer _merge_product, which resolves contractions with the
+      operand outside the bracket.
     """
     if not terms:
         return IndexInfo({}, set())
@@ -184,22 +214,34 @@ def _merge_sum(terms: list[IndexInfo]) -> IndexInfo:
         if t.error:
             return t
 
-    # All terms must have same free indices
-    reference = terms[0]
     all_dummy = set()
     for t in terms:
         all_dummy |= t.dummy
 
-    for i, t in enumerate(terms[1:], 1):
-        if t.free != reference.free:
-            # Build a readable description of the mismatch
-            ref_desc = _format_free(reference.free)
-            cur_desc = _format_free(t.free)
-            return IndexInfo({}, set(),
-                error=f"Inconsistent free indices across additive terms: "
-                      f"term 1 has {ref_desc}, but term {i+1} has {cur_desc}.")
-
-    return IndexInfo(dict(reference.free), all_dummy)
+    if strict:
+        # All terms must have same free indices (name AND position)
+        reference = terms[0]
+        for i, t in enumerate(terms[1:], 1):
+            if t.free != reference.free:
+                ref_desc = _format_free(reference.free)
+                cur_desc = _format_free(t.free)
+                return IndexInfo({}, set(),
+                    error=f"Inconsistent free indices across additive terms: "
+                          f"term 1 has {ref_desc}, but term {i+1} has {cur_desc}.")
+        return IndexInfo(dict(reference.free), all_dummy)
+    else:
+        # Permissive mode: union of all free indices across bracket terms.
+        # Still flag contradictory positions (same name, different up/down).
+        union_free: dict[str, bool] = {}
+        for t in terms:
+            for name, is_upper in t.free.items():
+                if name not in union_free:
+                    union_free[name] = is_upper
+                elif union_free[name] != is_upper:
+                    return IndexInfo({}, set(),
+                        error=f"Index '{name}' appears as both upper and lower "
+                              f"in different terms within the same bracket group.")
+        return IndexInfo(union_free, all_dummy)
 
 
 def _format_free(free: dict[str, bool]) -> str:
@@ -216,12 +258,14 @@ def _format_free(free: dict[str, bool]) -> str:
 # Recursive descent over the token stream.
 
 class Parser:
-    """
+    r"""
     Parse a token stream into index information, respecting:
     - Parenthetical grouping: (...)
     - Additive terms: +, -
     - Implicit multiplication: juxtaposition of atoms/factors
-    - Equation sides: =
+    - Equation sides: =, \approx, \equiv, \iff, \Rightarrow, \Leftrightarrow
+    - \frac{numerator}{denominator}: numerator contributes indices, denominator is scalar
+    - Decorator commands (\tilde, \hat, \sqrt, \cancel, ...): transparent to inner indices
     """
 
     def __init__(self, tokens: list[Token]):
@@ -253,10 +297,9 @@ class Parser:
 
     def parse_full(self) -> IndexInfo:
         """
-        Parse the entire expression. If there's an '=' sign, treat it as
-        an equation and verify both sides match.
+        Parse the entire expression. If there's an '=' sign (or other relation
+        separator), treat it as an equation and verify both sides match.
         """
-        # Split at top-level '=' signs
         sides = self._parse_equation()
         if len(sides) == 1:
             return sides[0]
@@ -282,20 +325,32 @@ class Parser:
         return IndexInfo(dict(reference.free), all_dummy)
 
     def _parse_equation(self) -> list[IndexInfo]:
-        """Parse expression, splitting at top-level '='."""
+        r"""
+        Parse expression, splitting at top-level '=' and relation separators
+        (\approx, \equiv, \iff, \Rightarrow, \Leftrightarrow).
+        """
         sides = [self._parse_expr()]
         while True:
             tok = self._peek()
-            if tok and tok.type == T_CHAR and tok.text == "=":
-                self._advance()  # consume '='
+            if tok is None:
+                break
+            # Plain '=' character
+            if tok.type == T_CHAR and tok.text == "=":
+                self._advance()
+                sides.append(self._parse_expr())
+            elif tok.type == T_COMMAND and tok.text in _EQUATION_SEPARATORS:
+                self._advance()
                 sides.append(self._parse_expr())
             else:
                 break
         return sides
 
-    def _parse_expr(self) -> IndexInfo:
-        """
+    def _parse_expr(self, bracket_mode: bool = False) -> IndexInfo:
+        r"""
         Expr = Term (('+' | '-') Term)*
+
+        bracket_mode=True uses permissive sum merging, deferring free-index
+        consistency checking to the outer product context.
         """
         terms = [self._parse_term()]
 
@@ -307,12 +362,12 @@ class Parser:
             else:
                 break
 
-        return _merge_sum(terms)
+        return _merge_sum(terms, strict=not bracket_mode)
 
     def _parse_term(self) -> IndexInfo:
         """
         Term = Factor (implicit-multiply Factor)*
-        
+
         Implicit multiplication: two factors next to each other with no
         '+'/'-'/'='/')' between them.  We also handle explicit '*'.
         """
@@ -322,10 +377,10 @@ class Parser:
             tok = self._peek()
             if tok is None:
                 break
-            # Stop at additive operators, '=', or closing parens / \right
+            # Stop at additive operators, equation separators, or closing delimiters
             if tok.type == T_CHAR and tok.text in ("+", "-", "=", ")"):
                 break
-            if tok.type == T_COMMAND and tok.text == r"\right":
+            if tok.type == T_COMMAND and tok.text in (r"\right", *_EQUATION_SEPARATORS):
                 break
             # Explicit multiplication sign: consume and continue
             if tok.type == T_CHAR and tok.text == "*":
@@ -343,7 +398,7 @@ class Parser:
         return result
 
     def _is_factor_start(self, tok: Token) -> bool:
-        """Check if a token can start a new factor (atom or '(' or '\\left')."""
+        """Check if a token can start a new factor."""
         if tok.type == T_CHAR and tok.text == "(":
             return True
         if tok.type == T_COMMAND and tok.text == r"\left":
@@ -353,50 +408,53 @@ class Parser:
         if tok.type == T_COMMAND:
             return True
         if tok.type == T_LBRACE:
-            # Could be start of a group
             return True
         return False
 
     def _parse_factor(self) -> IndexInfo:
         r"""
         Factor = '(' Expr ')' [indices]
-               | '\left' delim Expr '\right' delim [indices]
+               | '\left' delim Expr '\right' [delim] [indices]
+               | '\frac' '{' Expr '}' '{' Expr '}' [indices]
+               | decorator_cmd '{' Expr '}' [indices]
                | Atom
         """
         tok = self._peek()
         if tok is None:
             return IndexInfo({}, set())
 
-        # Plain parentheses: ( Expr )
+        # ── Plain parentheses: ( Expr ) ──────────────────────────────────────
         if tok.type == T_CHAR and tok.text == "(":
             self._advance()  # consume '('
-            inner = self._parse_expr()
-            # Consume closing ')'
+            inner = self._parse_expr(bracket_mode=True)
             close = self._peek()
             if close and close.type == T_CHAR and close.text == ")":
                 self._advance()
-            # After a parenthesized group, there might be indices on the group
             indices = self._collect_trailing_indices()
             if indices:
                 atom_info = self._make_index_info(indices)
                 return _merge_product(inner, atom_info)
             return inner
 
-        # \left( ... \right)  (or \left[ ... \right] etc.)
+        # ── \left( ... \right) ───────────────────────────────────────────────
         if tok.type == T_COMMAND and tok.text == r"\left":
             self._advance()  # consume \left
             # Consume the delimiter character after \left (e.g. '(' '[' '.' etc.)
             delim = self._peek()
             if delim is not None:
                 self._advance()
-            inner = self._parse_expr()
+            inner = self._parse_expr(bracket_mode=True)
             # Consume \right
             close = self._peek()
             if close and close.type == T_COMMAND and close.text == r"\right":
                 self._advance()
-                # Consume the delimiter after \right
+                # Consume the delimiter after \right.
+                # It may be T_CHAR (for ')', '.'), T_RBRACKET (for ']'),
+                # T_RBRACE (for '}'), or T_LBRACKET (for '[').
                 delim2 = self._peek()
-                if delim2 is not None and delim2.type == T_CHAR:
+                if delim2 is not None and delim2.type in (
+                    T_CHAR, T_RBRACKET, T_RBRACE, T_LBRACKET
+                ):
                     self._advance()
             # Trailing indices on the group
             indices = self._collect_trailing_indices()
@@ -405,12 +463,53 @@ class Parser:
                 return _merge_product(inner, atom_info)
             return inner
 
+        # ── \frac{numerator}{denominator} ─────────────────────────────────────
+        # Only the numerator carries free indices; denominator is scalar context.
+        if tok.type == T_COMMAND and tok.text == r"\frac":
+            self._advance()                         # consume \frac
+            numerator    = self._parse_brace_expr() # {numerator} — indices live here
+            _denominator = self._parse_brace_expr() # {denominator} — discarded (scalar)
+            # Trailing indices on the whole fraction (rare but valid, e.g. \frac{A}{B}^i)
+            indices = self._collect_trailing_indices()
+            if indices:
+                return _merge_product(numerator, self._make_index_info(indices))
+            return numerator
+
+        # ── Transparent decorator commands ────────────────────────────────────
+        # \tilde, \hat, \sqrt, \cancel, \partial, \nabla, etc.
+        # These wrap a single brace argument; pass the inner IndexInfo through.
+        if tok.type == T_COMMAND and tok.text in _TRANSPARENT_COMMANDS:
+            self._advance()                   # consume the command
+            inner = self._parse_brace_expr()  # parse {argument}
+            # Trailing indices on the decorated symbol (e.g. \tilde{A}^i_j)
+            indices = self._collect_trailing_indices()
+            if indices:
+                return _merge_product(inner, self._make_index_info(indices))
+            return inner
+
         return self._parse_atom()
+
+    def _parse_brace_expr(self) -> IndexInfo:
+        """
+        Consume a { ... } group and parse its contents as a full expression,
+        returning a proper IndexInfo instead of discarding the content.
+        If no opening brace is found, returns an empty IndexInfo.
+        """
+        self._skip_whitespace()
+        if self.pos >= len(self.tokens) or self.tokens[self.pos].type != T_LBRACE:
+            return IndexInfo({}, set())
+        self.pos += 1  # consume '{'
+        inner = self._parse_expr()
+        # Consume closing '}'
+        self._skip_whitespace()
+        if self.pos < len(self.tokens) and self.tokens[self.pos].type == T_RBRACE:
+            self.pos += 1
+        return inner
 
     def _parse_atom(self) -> IndexInfo:
         r"""
         Atom = symbol [sub/super indices]*
-        
+
         A symbol is a single letter, a command (\alpha, \Gamma, etc.),
         or a digit sequence.  After it we collect any subscript/superscript
         index groups.
@@ -424,8 +523,6 @@ class Parser:
             self._advance()
         elif tok.type == T_COMMAND:
             # \left and \right are structural delimiters, not tensor symbols.
-            # If we reach here it means the factor handler didn't catch them
-            # (e.g. mismatched delimiters).  Skip without collecting indices.
             if tok.text in (r"\left", r"\right"):
                 self._advance()
                 return IndexInfo({}, set())
@@ -443,7 +540,7 @@ class Parser:
         return self._make_index_info(indices)
 
     def _skip_brace_group(self):
-        """Skip a { ... } group including nested braces."""
+        """Skip a { ... } group including nested braces (used for opaque groups)."""
         tok = self._advance()  # consume '{'
         depth = 1
         while depth > 0:
@@ -507,6 +604,8 @@ class Parser:
                 return None
             return tok.text
         if tok.type == T_COMMAND:
+            if tok.text in NON_INDEX_COMMANDS:
+                return None
             return tok.text
         # Skip commas, spaces, digits-in-indices, backslash-space, etc.
         return None
