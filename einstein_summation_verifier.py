@@ -230,8 +230,23 @@ def _merge_sum(terms: list[IndexInfo], strict: bool = True) -> IndexInfo:
                           f"term 1 has {ref_desc}, but term {i+1} has {cur_desc}.")
         return IndexInfo(dict(reference.free), all_dummy)
     else:
-        # Permissive mode: union of all free indices across bracket terms.
-        # Still flag contradictory positions (same name, different up/down).
+        # Permissive mode: used inside brackets that will be multiplied by an
+        # outer operand which may resolve contractions not yet seen.
+        #
+        # However, rank mismatches are ALWAYS errors regardless of context or
+        # parentheses — you cannot add tensors of different rank. So we still
+        # require every term to have the same free index NAME SET (same rank).
+        # The only thing deferred to the outer product is up/down resolution.
+        reference = terms[0]
+        ref_names = set(reference.free.keys())
+        for i, t in enumerate(terms[1:], 1):
+            if set(t.free.keys()) != ref_names:
+                ref_desc = _format_free(reference.free)
+                cur_desc = _format_free(t.free)
+                return IndexInfo({}, set(),
+                    error=f"Inconsistent free indices across additive terms: "
+                          f"term 1 has {ref_desc}, but term {i+1} has {cur_desc}.")
+        # Name sets match — take union, but flag contradictory up/down positions.
         union_free: dict[str, bool] = {}
         for t in terms:
             for name, is_upper in t.free.items():
