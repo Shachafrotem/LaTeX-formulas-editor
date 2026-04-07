@@ -18,6 +18,7 @@ from latex_index_editor import (
     T_COMMAND, T_CHAR, T_SUBSCRIPT, T_SUPER,
     ParseError, RuleError,
     SubRule,
+    _index_symbol,
 )
 from einstein_summation_verifier import verify, VerificationResult
 
@@ -474,37 +475,71 @@ def test_digit_not_treated_as_index():
         assert t.role == "body", f"Digit '2' was classified as {t.role}"
 
 
-def test_t_not_treated_as_index():
-    """Letter 't' represents time and should never be treated as a tensor index."""
-    toks = tokenize(r"T^i_t")
-    classify(toks, {"i"})
-    t_toks = [t for t in toks if t.text == "t"]
-    for t in t_toks:
-        assert t.role == "body", f"Letter 't' was classified as {t.role}"
-    i_toks = [t for t in toks if t.text == "i"]
-    assert any(t.role == "free" for t in i_toks), "Index 'i' should still be free"
-
-
-def test_t_not_detected_as_dummy():
-    """A_t B^t — 't' must not be detected as a contracted dummy index."""
-    toks = tokenize(r"A_t B^t")
-    classify(toks, set())
-    t_toks = [t for t in toks if t.text == "t"]
-    for t in t_toks:
-        assert t.role == "body", f"Letter 't' was classified as {t.role}"
-
-
-def test_t_not_eligible_for_substitution():
-    """Rules targeting 't' should have no effect — it's not an index."""
-    toks = tokenize(r"g^{tt}")
-    classify(toks, set())
-    eligible = {t.text for t in toks if t.role in ("free", "dummy")}
-    assert "t" not in eligible, "'t' should not be eligible for substitution"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Runner (plain python, no pytest needed)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-Index Symbols (new feature)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_nonindex_letter_excluded():
+    """A letter declared as non-index should be classified as structural, not dummy."""
+    toks = tokenize(r"A_t B_t")
+    classify(toks, set(), frozenset({"t"}))
+    t_toks = [t for t in toks if t.text == "t"]
+    assert len(t_toks) == 2
+    for t in t_toks:
+        assert t.role != "dummy", f"t should not be dummy, got role={t.role}"
+
+
+def test_nonindex_command_excluded():
+    r"""A command declared as non-index (e.g. \perp) should be structural."""
+    toks = tokenize(r"v_{\perp}")
+    classify(toks, set(), frozenset({r"\perp"}))
+    perp = [t for t in toks if t.text == r"\perp"]
+    assert len(perp) == 1
+    assert perp[0].role != "free" and perp[0].role != "dummy", \
+        f"\\perp should be structural, got role={perp[0].role}"
+
+
+def test_nonindex_not_eligible():
+    """A rule targeting a non-index symbol should produce a warning."""
+    toks = tokenize(r"A^{\mu}{}_{\mu} B_t")
+    ni = frozenset({"t"})
+    classify(toks, set(), ni)
+    eligible = set()
+    for t in toks:
+        sym = _index_symbol(t, ni)
+        if sym and t.role in ("free", "dummy"):
+            eligible.add(sym)
+    assert r"\mu" in eligible, f"\\mu should be eligible, got {eligible}"
+    assert "t" not in eligible, f"t should NOT be eligible, got {eligible}"
+    _, warnings = parse_rules("t->s", eligible)
+    assert any("no effect" in w for w in warnings), \
+        f"Expected 'no effect' warning, got: {warnings}"
+
+
+def test_nonindex_empty_backward_compat():
+    """With no non-index set, t appearing twice should be detected as dummy (backward compat)."""
+    toks = tokenize(r"A_t B_t")
+    classify(toks, set())  # no nonindex → default empty frozenset
+    t_toks = [t for t in toks if t.text == "t"]
+    assert any(t.role == "dummy" for t in t_toks), \
+        f"t should be dummy when nonindex is empty, got roles={[t.role for t in t_toks]}"
+
+
+def test_nonindex_mixed():
+    r"""Mixed: \mu is dummy (contracted), t is excluded as non-index."""
+    toks = tokenize(r"T^{\mu}{}_{\mu} A_t")
+    classify(toks, set(), frozenset({"t"}))
+    mu_toks = [t for t in toks if t.text == r"\mu"]
+    t_toks  = [t for t in toks if t.text == "t"]
+    assert all(t.role == "dummy" for t in mu_toks), \
+        f"\\mu should be dummy, got roles={[t.role for t in mu_toks]}"
+    assert all(t.role != "dummy" for t in t_toks), \
+        f"t should not be dummy, got roles={[t.role for t in t_toks]}"
+
 
 if __name__ == "__main__":
     import traceback

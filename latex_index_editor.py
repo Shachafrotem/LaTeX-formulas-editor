@@ -25,12 +25,13 @@ from tkinter import ttk, messagebox
 from dataclasses import dataclass, field
 from typing import Optional
 
+import einstein_summation_verifier as _esv
+
 from einstein_summation_verifier import (
     tokenize, Token,
     T_COMMAND, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET,
     T_SUBSCRIPT, T_SUPER, T_SPACE, T_CHAR,
     verify, VerificationResult,
-    NON_INDEX_LETTERS,
 )
 
 
@@ -84,19 +85,22 @@ def friendly_message(exc: Exception) -> str:
 # MODULE 2 – Index Classifier
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _index_symbol(tok: Token) -> Optional[str]:
+def _index_symbol(tok: Token, nonindex: frozenset[str] = frozenset()) -> Optional[str]:
     """Return the *symbol string* for a token that could be an index, else None."""
     if tok.type == T_CHAR and re.match(r"[A-Za-z]", tok.text):
-        if tok.text in NON_INDEX_LETTERS:
+        if tok.text in nonindex:
             return None
         return tok.text
     if tok.type == T_COMMAND:
+        if tok.text in nonindex:
+            return None
         return tok.text          # e.g. \mu, \nu
     return None
 
 
 def _collect_candidates_with_slots(
     tokens: list[Token],
+    nonindex: frozenset[str] = frozenset(),
 ) -> tuple[list[int], dict[int, int]]:
     """
     Walk the token stream and return every token that sits in an index
@@ -137,7 +141,7 @@ def _collect_candidates_with_slots(
                 while i < n and tokens[i].type == T_SPACE:
                     i += 1
                 while i < n and tokens[i].type != T_RBRACE:
-                    if _index_symbol(tokens[i]) is not None:
+                    if _index_symbol(tokens[i], nonindex) is not None:
                         tokens[i].upper = is_upper
                         candidate_positions.append(i)
                         slot_map[i] = slot_id
@@ -145,7 +149,7 @@ def _collect_candidates_with_slots(
                 i += 1  # skip }
             else:
                 # single-token index
-                if _index_symbol(tokens[i]) is not None:
+                if _index_symbol(tokens[i], nonindex) is not None:
                     tokens[i].upper = is_upper
                     candidate_positions.append(i)
                     slot_map[i] = slot_id
@@ -156,12 +160,12 @@ def _collect_candidates_with_slots(
     return candidate_positions, slot_map
 
 
-def _collect_candidates(tokens: list[Token]) -> list[int]:
+def _collect_candidates(tokens: list[Token], nonindex: frozenset[str] = frozenset()) -> list[int]:
     """
     Convenience wrapper around _collect_candidates_with_slots that returns
     only the candidate position list (for callers that don't need slot info).
     """
-    candidate_positions, _ = _collect_candidates_with_slots(tokens)
+    candidate_positions, _ = _collect_candidates_with_slots(tokens, nonindex)
     return candidate_positions
 
 
@@ -225,7 +229,8 @@ def _split_candidates_by_term(
     return [g for g in groups if g]
 
 
-def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
+def classify(tokens: list[Token], free_symbols: set[str],
+             nonindex: frozenset[str] = frozenset()) -> list[str]:
     """
     Tag every token in *tokens* with a .role:
       'free'       – declared by the user as a free index
@@ -237,7 +242,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
     """
     warnings: list[str] = []
 
-    candidate_positions, slot_map = _collect_candidates_with_slots(tokens)
+    candidate_positions, slot_map = _collect_candidates_with_slots(tokens, nonindex)
 
     # ── Per-term dummy detection ──────────────────────────────────────────────
     # Split candidates into groups, one per top-level additive term (terms are
@@ -250,7 +255,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
     for group in term_groups:
         term_count: dict[str, int] = {}
         for pos in group:
-            sym = _index_symbol(tokens[pos])
+            sym = _index_symbol(tokens[pos], nonindex)
             if sym:
                 term_count[sym] = term_count.get(sym, 0) + 1
         for sym, cnt in term_count.items():
@@ -284,7 +289,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
             slot_syms: dict[int, list[str]] = {}
             for pos in group:
                 sid = slot_map.get(pos)
-                s = _index_symbol(tokens[pos])
+                s = _index_symbol(tokens[pos], nonindex)
                 if sid is not None and s:
                     slot_syms.setdefault(sid, []).append(s)
 
@@ -301,7 +306,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
             )
 
             if trace or exclusive_count >= 2:
-                total = sum(1 for pos in group if _index_symbol(tokens[pos]) == sym)
+                total = sum(1 for pos in group if _index_symbol(tokens[pos], nonindex) == sym)
                 warnings.append(
                     f"'{sym}' is declared as a free index but appears {total} time(s) "
                     f"in exclusive index slots within the same term "
@@ -311,7 +316,7 @@ def classify(tokens: list[Token], free_symbols: set[str]) -> list[str]:
 
     # Tag candidate tokens
     for pos in candidate_positions:
-        sym = _index_symbol(tokens[pos])
+        sym = _index_symbol(tokens[pos], nonindex)
         if sym is None:
             continue
         if sym in free_symbols:
@@ -379,7 +384,8 @@ def parse_rules(rule_text: str, eligible_symbols: set[str]) -> tuple[list[SubRul
 # MODULE 4 – Simultaneous Substitution Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
-def substitute(tokens: list[Token], rules: list[SubRule]) -> list[Token]:
+def substitute(tokens: list[Token], rules: list[SubRule],
+               nonindex: frozenset[str] = frozenset()) -> list[Token]:
     """
     Return a *new* list of Token objects with all substitutions applied
     simultaneously.  Only tokens with role 'free' or 'dummy' are touched.
@@ -389,7 +395,7 @@ def substitute(tokens: list[Token], rules: list[SubRule]) -> list[Token]:
 
     for tok in tokens:
         if tok.role in ("free", "dummy"):
-            sym = _index_symbol(tok)
+            sym = _index_symbol(tok, nonindex)
             if sym and sym in lookup:
                 new_tok = Token(
                     type=tok.type,
@@ -423,6 +429,7 @@ class DiffReport:
     dummy_patterns:  dict[str, str]   # dummy symbol → pattern description
     changes:         list[str]        # human-readable change lines
     warnings:        list[str]        # all collected warnings
+    nonindex_symbols: frozenset[str] = field(default_factory=frozenset)  # excluded symbols
 
 
 def generate_diff(
@@ -431,6 +438,7 @@ def generate_diff(
     rules: list[SubRule],
     classifier_warnings: list[str],
     rule_warnings: list[str],
+    nonindex: frozenset[str] = frozenset(),
 ) -> DiffReport:
     """
     Produce a DiffReport comparing *original* and *modified* token streams.
@@ -441,7 +449,7 @@ def generate_diff(
     dummy_lower_count: dict[str, int] = {}
 
     for tok in original:
-        sym = _index_symbol(tok)
+        sym = _index_symbol(tok, nonindex)
         if sym and tok.role != "body":
             classifications[sym] = tok.role
             if tok.role == "dummy":
@@ -551,6 +559,12 @@ def format_report(
         else:
             lines.append("  ILL-FORMED ✗")
             lines.append(f"  {output_result.error}")
+
+    # ── Non-Index Exclusions ──
+    if report.nonindex_symbols:
+        lines.append("")
+        lines.append("─── Non-Index Exclusions ───")
+        lines.append(f"  {', '.join(sorted(report.nonindex_symbols))}  (excluded from index analysis)")
 
     # ── Warnings ──  [LIE-16]: keep rule-parser warnings only
     if report.warnings:
@@ -681,12 +695,39 @@ class LaTeXIndexEditorApp:
             height=4,
         )
 
-        # ── (2) Replacement rules ──
-        self._rules_box = self._labeled_textbox(
-            col,
-            "(2) Replacement Rules\n(one per line or comma-separated, e.g.  i->r)",
-            height=3,
+        # ── (1b) Non-Index Symbols + (2) Replacement Rules — side by side ──
+        pair_frame = tk.Frame(col, bg=BG_DARK)
+        pair_frame.pack(fill="x", padx=8, pady=(8, 0))
+        pair_frame.columnconfigure(0, weight=1, uniform="pair")
+        pair_frame.columnconfigure(1, weight=1, uniform="pair")
+
+        # Left: Non-Index Symbols
+        lbl_ni = self._section_label(pair_frame, "(1b) Non-Index Symbols")
+        lbl_ni.grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self._nonindex_box = tk.Text(
+            pair_frame, height=3,
+            font=FONT_MONO, bg=BG_FIELD, fg=FG_MAIN,
+            insertbackground=FG_MAIN, relief="flat",
+            padx=8, pady=6,
+            highlightbackground=BORDER, highlightthickness=1,
         )
+        self._nonindex_box.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        ToolTip(self._nonindex_box,
+            "Symbols in index positions that are NOT tensor indices.\n"
+            "One per line or comma-separated (e.g. t, n, \\perp).\n"
+            "Default: t is already excluded.")
+
+        # Right: Replacement Rules
+        lbl_rr = self._section_label(pair_frame, "(2) Rules  (e.g. i->r)")
+        lbl_rr.grid(row=0, column=1, sticky="w", pady=(0, 2))
+        self._rules_box = tk.Text(
+            pair_frame, height=3,
+            font=FONT_MONO, bg=BG_FIELD, fg=FG_MAIN,
+            insertbackground=FG_MAIN, relief="flat",
+            padx=8, pady=6,
+            highlightbackground=BORDER, highlightthickness=1,
+        )
+        self._rules_box.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
 
         # ── Buttons row: Apply + Clear side by side ──
         btn_frame = tk.Frame(col, bg=BG_DARK)
@@ -814,7 +855,7 @@ class LaTeXIndexEditorApp:
             self._set_status("Output copied to clipboard.", ok=True)
 
     def _clear_all(self):
-        for box in (self._input_box, self._rules_box):
+        for box in (self._input_box, self._nonindex_box, self._rules_box):
             box.delete("1.0", "end")
         self._set_output("")
         self._set_summary("")
@@ -831,7 +872,32 @@ class LaTeXIndexEditorApp:
             self._set_status("Please enter a LaTeX formula in the Input Formula field.")
             return
 
+        # ── Parse non-index symbols from (1b) ──
+        nonindex_text = self._nonindex_box.get("1.0", "end").strip()
+        user_nonindex_letters: set[str] = set()
+        user_nonindex_commands: set[str] = set()
+        if nonindex_text:
+            for part in re.split(r"[,\n]+", nonindex_text):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.startswith("\\"):
+                    user_nonindex_commands.add(part)
+                else:
+                    user_nonindex_letters.add(part)
+
+        # ── Patch verifier exclusion globals (restored in finally) ──
+        orig_letters = _esv.NON_INDEX_LETTERS
+        orig_commands = _esv.NON_INDEX_COMMANDS
+        _esv.NON_INDEX_LETTERS = orig_letters | frozenset(user_nonindex_letters)
+        _esv.NON_INDEX_COMMANDS = orig_commands | frozenset(user_nonindex_commands)
+
         try:
+            # Merged exclusion set for the editor's own classifier
+            merged_nonindex = frozenset(
+                _esv.NON_INDEX_LETTERS | _esv.NON_INDEX_COMMANDS
+            )
+
             # ── Module 1: Tokenize ──
             tokens = tokenize(latex_input)
 
@@ -840,7 +906,7 @@ class LaTeXIndexEditorApp:
             if not input_result.well_formed:
                 self._set_status(f"Input ill-formed: {input_result.error}")
                 self._set_summary(format_report(
-                    DiffReport({}, {}, [], []),
+                    DiffReport({}, {}, [], [], nonindex_symbols=merged_nonindex),
                     "",
                     input_result=input_result,
                     output_result=None,
@@ -851,12 +917,12 @@ class LaTeXIndexEditorApp:
             free_symbols: set[str] = set(input_result.free_indices.keys())
 
             # ── Module 2: Classify ──
-            classifier_warnings = classify(tokens, free_symbols)
+            classifier_warnings = classify(tokens, free_symbols, merged_nonindex)
 
             # Compute eligible symbols (free + dummy)
             eligible: set[str] = set()
             for tok in tokens:
-                sym = _index_symbol(tok)
+                sym = _index_symbol(tok, merged_nonindex)
                 if sym and tok.role in ("free", "dummy"):
                     eligible.add(sym)
 
@@ -867,7 +933,7 @@ class LaTeXIndexEditorApp:
                 rules, rule_warnings = parse_rules(rules_text, eligible)
 
             # ── Module 4: Substitute ──
-            modified_tokens = substitute(tokens, rules)
+            modified_tokens = substitute(tokens, rules, merged_nonindex)
 
             # ── Module 5: Reconstruct ──
             output_latex = reconstruct(modified_tokens)
@@ -879,7 +945,9 @@ class LaTeXIndexEditorApp:
             report = generate_diff(
                 tokens, modified_tokens, rules,
                 classifier_warnings, rule_warnings,
+                nonindex=merged_nonindex,
             )
+            report.nonindex_symbols = merged_nonindex
             summary_text = format_report(
                 report, output_latex,
                 input_result=input_result,
@@ -909,6 +977,9 @@ class LaTeXIndexEditorApp:
             self._set_status(friendly_message(exc))
         except Exception as exc:
             self._set_status(f"Unexpected error: {exc}")
+        finally:
+            _esv.NON_INDEX_LETTERS = orig_letters
+            _esv.NON_INDEX_COMMANDS = orig_commands
 
 
 # ─────────────────────────────────────────────────────────────────────────────
