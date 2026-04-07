@@ -45,6 +45,7 @@ NON_INDEX_LETTERS: frozenset[str] = frozenset({"t"})
 # tensor indices. Extend this (or patch via sed) to exclude additional symbols.
 NON_INDEX_COMMANDS: frozenset[str] = frozenset({
     r"\perp", r"\parallel", r"\rm", r"\mathrm",
+    r"\left",r"\right"
 })
 
 # ─── Transparent decorator commands ──────────────────────────────────────────
